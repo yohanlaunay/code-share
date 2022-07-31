@@ -1,0 +1,183 @@
+using System.Collections.Generic;
+using Sirenix.OdinInspector;
+using Steamworks;
+using Steamworks.Data;
+using UnityEngine;
+
+namespace FireBiscuit {
+    public class SteamSystem : MonoBehaviour {
+
+        [Required, SerializeField] private bool enableInEditor = false;
+
+        private readonly List<SteamAchievement> allAchievements = new List<SteamAchievement>();
+        private readonly List<SteamAchievement> lockedAchievements = new List<SteamAchievement>();
+
+        public bool IsInitialized => SteamClient.IsValid;
+
+        public void EvaluateAchievements(CrusadeState crusade) {
+            if (!SteamClient.IsValid) {
+                return;
+            }
+            for (int i = lockedAchievements.Count - 1; i >= 0; i--) {
+                SteamAchievement achievement = lockedAchievements[i];
+                achievement.Evaluate(crusade);
+                if (achievement.IsUnlocked) {
+                    lockedAchievements.RemoveAt(i); // don't need to evaluate it again.
+                }
+            }
+        }
+
+#if UNITY_EDITOR
+        public void ResetAchievements() {
+            foreach (SteamAchievement achievement in allAchievements) {
+                achievement.Clear();
+            }
+            this.lockedAchievements.Clear();
+            this.lockedAchievements.AddRange(allAchievements);
+        }
+#endif
+
+        private void Awake() {
+            if (Instance != null) {
+                Destroy(this);
+                return;
+            }
+            Instance = this;
+
+            if (!enableInEditor && Application.isEditor) {
+                return;
+            }
+
+            uint steamAppId = GameConfig.Instance.CurrentEnvironmentConfig.SteamAppId;
+            if (steamAppId == 0) {
+                Logger.LogInfo("Steam> App Not Enabled");
+                return;
+            }
+
+            try {
+
+                Logger.LogInfo("Steam> Initializing Client");
+                SteamClient.Init(appid: steamAppId);
+                Logger.LogInfo("Steam> Client Initialized");
+
+                DontDestroyOnLoad(this.gameObject);
+
+                loadUserStats();
+            } catch (System.Exception e) {
+                Logger.LogError(e, "Steam> Error initializing Client");
+            }
+        }
+
+        private void OnDestroy() {
+            if (Instance != this) {
+                return; // don't shutdown client if we are not owner of it.
+            }
+
+            Instance = null;
+            SteamClient.Shutdown();
+        }
+
+        private void Update() {
+            if (!SteamClient.IsValid) {
+                return;
+            }
+            SteamClient.RunCallbacks();
+        }
+
+        private void loadUserStats() {
+            this.allAchievements.Clear();
+            this.lockedAchievements.Clear();
+
+            SteamUserStats.OnUserStatsReceived -= onUserStatsReceivedOnce;
+            SteamUserStats.OnUserStatsReceived += onUserStatsReceivedOnce;
+
+            if (!SteamUserStats.RequestCurrentStats()) {
+                Logger.LogError("Steam> Could not request stats & achievements");
+            }
+        }
+
+        private void onUserStatsReceivedOnce(SteamId steamId, Result result) {
+            SteamUserStats.OnUserStatsReceived -= onUserStatsReceivedOnce; // prevent multiple updates
+
+            if (result != Result.OK && result != Result.AdministratorOK) {
+                Logger.LogError($"Steam> Could not retrieve stats & achievements: {result}");
+                return;
+            }
+
+            loadAchievements();
+        }
+
+        private void loadAchievements() {
+            this.allAchievements.Clear();
+            this.lockedAchievements.Clear();
+
+            Dictionary<string, Achievement> steamAchievements = new Dictionary<string, Achievement>();
+            HashSet<string> unknownAchievements = CollectionPools.HashSet<string>();
+            try {
+
+                // load from steam first
+                foreach (var achievement in SteamUserStats.Achievements) {
+                    steamAchievements[achievement.Identifier] = achievement;
+                }
+
+                unknownAchievements.UnionWith(steamAchievements.Keys);
+
+                // update our internal list
+                ResourceSystem.Instance.GetAll(this.allAchievements);
+                for (int i = this.allAchievements.Count - 1; i >= 0; i--) {
+                    SteamAchievement achievement = this.allAchievements[i];
+                    string achievementId = achievement.SteamAchievementId;
+                    if (!steamAchievements.TryGetValue(achievementId, out Achievement steamAchievement)) {
+                        Logger.LogWarning($"Steam> Achievement not available: {achievementId}");
+                        this.allAchievements.RemoveAt(i);
+                        continue;
+                    }
+
+                    if (!unknownAchievements.Remove(achievementId)) {
+                        Logger.LogError($"Steam> Duplicate Achievement Id {achievementId}");
+                        // skip to prevent weird behavior and remove all other achievements with same Id since
+                        // we don't know which one is the real one.
+                        // Should only happen in dev.
+                        this.allAchievements.RemoveAll((a) => a.SteamAchievementId == achievementId);
+                        continue;
+                    }
+
+                    achievement.Initialize(isInitUnlocked: steamAchievement.State,
+                        onUnlocked: () => {
+                            Logger.LogInfo($"Steam> Achievement Unlocked: {achievementId}");
+                            steamAchievement.Trigger();
+                            AnalyticsSystem.Instance.ReportAchievementUnlocked(achievementId: achievementId);
+                        },
+                        onCleared: () => {
+                            Logger.LogInfo($"Steam> Achievement Cleared: {achievementId}");
+                            steamAchievement.Clear();
+                        }
+                    );
+
+                    if (!achievement.IsUnlocked) {
+                        this.lockedAchievements.Add(achievement);
+                    }
+                }
+
+#if UNITY_EDITOR
+                if (unknownAchievements.Count > 0) {
+                    Logger.LogError("Steam> Missing Achievements Implementation (" + unknownAchievements.Count + ") " + unknownAchievements.Join(","));
+                }
+#endif
+            } finally {
+                CollectionPools.Return(unknownAchievements);
+            }
+
+            Logger.LogInfo("Steam> Achievements Loaded");
+
+            // In case the achievements are loaded after the crusade has started, trigger evaluation without waiting for the next commit,
+            // we need to initialize them with current crusade state.
+            CrusadeState activeCrusade = CrusadeDirector.Instance?.ActiveCrusade.Or(null);
+            if (activeCrusade != null) {
+                EvaluateAchievements(activeCrusade);
+            }
+        }
+
+        public static SteamSystem Instance { get; private set; }
+    }
+}
